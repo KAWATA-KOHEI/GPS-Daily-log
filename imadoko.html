@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>いまどこ</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    body { font-family: 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', sans-serif; }
+    #map { height: 280px; }
+    .tab-active { border-bottom: 2px solid #4F6AF5; color: #4F6AF5; }
+    .tab-inactive { border-bottom: 2px solid transparent; color: #9CA3AF; }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    .fade-in { animation: fadeIn .3s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+
+<!-- ▼▼▼ ここを自分の Supabase 情報に書き換えてください ▼▼▼ -->
+<script>
+  const SUPABASE_URL  = 'https://wyqijmztuvnouuwjvxpp.supabase.co';
+  const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind5cWlqbXp0dXZub3V1d2p2eHBwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5NjA2MTcsImV4cCI6MjA5MzUzNjYxN30.QNHhSWVwEDqnHYuXeoijIGadm6e0OPg1AqRyDpn3urw';
+  const AUTO_INTERVAL_MIN = 30; // 自動記録の間隔（分）
+</script>
+<!-- ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲ -->
+
+<script>
+// ─── 初期化 ────────────────────────────────────────
+const { createClient } = supabase;
+const db = createClient(SUPABASE_URL, SUPABASE_ANON);
+
+const params     = new URLSearchParams(location.search);
+const viewUserId = params.get('view');
+const isViewMode = !!viewUserId;
+
+let myUserId = localStorage.getItem('imadoko_uid');
+if (!myUserId) {
+  myUserId = 'u_' + crypto.randomUUID().slice(0, 8);
+  localStorage.setItem('imadoko_uid', myUserId);
+}
+const TARGET_USER = isViewMode ? viewUserId : myUserId;
+
+// ─── 地図 ──────────────────────────────────────────
+let map = null, markers = [], polyline = null;
+
+function initMap() {
+  if (map) return;
+  map = L.map('map').setView([35.6762, 139.6503], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap contributors'
+  }).addTo(map);
+}
+
+function updateMap(records) {
+  if (!map) return;
+  markers.forEach(m => m.remove());
+  markers = [];
+  if (polyline) { polyline.remove(); polyline = null; }
+  if (!records.length) return;
+
+  const latlngs = records.map(r => [r.lat, r.lng]);
+
+  if (latlngs.length > 1) {
+    polyline = L.polyline(latlngs, { color: '#4F6AF5', weight: 3, dashArray: '6,4' }).addTo(map);
+  }
+
+  records.forEach((r, i) => {
+    const icon = L.divIcon({
+      className: '',
+      html: `<div style="
+        width:26px;height:26px;border-radius:50%;
+        background:${r.is_manual ? '#EF4444' : '#4F6AF5'};
+        color:#fff;font-size:11px;font-weight:700;
+        display:flex;align-items:center;justify-content:center;
+        border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.3);">${i+1}</div>`,
+      iconSize: [26,26], iconAnchor: [13,13], popupAnchor: [0,-13]
+    });
+    const time = new Date(r.recorded_at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',hour12:false});
+    const badge = r.is_manual ? '📌 手動' : '🔄 自動';
+    const popup = `<b>${r.place_name||'不明な場所'}</b><br><span style="font-size:12px;color:#666">${time} · ${badge}</span>`;
+    const m = L.marker([r.lat, r.lng], { icon }).bindPopup(popup).addTo(map);
+    markers.push(m);
+  });
+
+  map.fitBounds(L.latLngBounds(latlngs), { padding: [30, 30] });
+  setTimeout(() => map.invalidateSize(), 200);
+}
+
+// ─── GPS取得 ───────────────────────────────────────
+async function recordLocation(isManual = false) {
+  if (isViewMode) return;
+  setStatus('位置情報を取得中…', 'yellow');
+
+  navigator.geolocation.getCurrentPosition(async pos => {
+    const { latitude: lat, longitude: lng, accuracy } = pos.coords;
+    setStatus('地名を検索中…', 'yellow');
+    const place = await reverseGeocode(lat, lng);
+    const { error } = await db.from('locations').insert({
+      user_id: myUserId, lat, lng,
+      accuracy: Math.round(accuracy),
+      place_name: place,
+      is_manual: isManual,
+      recorded_at: new Date().toISOString()
+    });
+    if (error) {
+      setStatus('保存失敗: ' + (error.message || error.code), 'red');
+      console.error(error);
+    } else {
+      setStatus(isManual ? '📌 手動記録しました' : '✅ 自動記録しました', 'green');
+      await loadRecords();
+    }
+  }, err => {
+    const msg = { 1:'GPS許可が必要です（設定で許可してください）', 2:'GPS取得失敗', 3:'GPS取得タイムアウト' };
+    setStatus(msg[err.code] || 'GPSエラー', 'red');
+  }, { enableHighAccuracy: true, timeout: 15000 });
+}
+
+async function reverseGeocode(lat, lng) {
+  try {
+    const r = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=ja`,
+      { headers: { 'User-Agent': 'imadoko-app/1.0' } }
+    );
+    const d = await r.json();
+    const a = d.address || {};
+    const parts = [
+      a.shop || a.amenity || a.building,
+      a.suburb || a.neighbourhood || a.quarter,
+      a.city || a.town || a.village || a.county
+    ].filter(Boolean);
+    return parts.length ? parts.join(' ') : (d.display_name||'').split(',')[0];
+  } catch { return `${lat.toFixed(4)}, ${lng.toFixed(4)}`; }
+}
+
+// ─── データ読み込み ────────────────────────────────
+async function loadRecords() {
+  const dateVal = document.getElementById('dateInput')?.value;
+  const date = dateVal || new Date().toLocaleDateString('sv');  // YYYY-MM-DD
+  const start = date + 'T00:00:00+09:00';
+  const end   = date + 'T23:59:59+09:00';
+
+  const { data, error } = await db.from('locations').select('*')
+    .eq('user_id', TARGET_USER)
+    .gte('recorded_at', start)
+    .lte('recorded_at', end)
+    .order('recorded_at', { ascending: true });
+
+  if (error) {
+    renderTable([]);
+    console.error('データ取得失敗:', error);
+    return;
+  }
+  renderTable(data || []);
+  updateMap(data || []);
+}
+
+function renderTable(rows) {
+  const el = document.getElementById('recordList');
+  const countEl = document.getElementById('recordCount');
+  if (countEl) countEl.textContent = rows.length + '件';
+  if (!el) return;
+
+  if (!rows.length) {
+    el.innerHTML = `<div class="text-center py-10 text-gray-400 text-sm">記録がありません</div>`;
+    return;
+  }
+
+  el.innerHTML = rows.map((r, i) => {
+    const time = new Date(r.recorded_at).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',hour12:false});
+    const badge = r.is_manual
+      ? `<span class="text-xs bg-red-50 text-red-500 px-2 py-0.5 rounded-full">手動</span>`
+      : `<span class="text-xs bg-blue-50 text-blue-400 px-2 py-0.5 rounded-full">自動</span>`;
+    return `
+      <div class="flex items-start gap-3 px-4 py-3 border-b border-gray-100 fade-in" style="animation-delay:${i*30}ms">
+        <div class="shrink-0 w-6 h-6 rounded-full bg-indigo-500 text-white text-xs font-bold flex items-center justify-center mt-0.5">${i+1}</div>
+        <div class="flex-1 min-w-0">
+          <p class="text-sm font-medium text-gray-800 truncate">${r.place_name||'不明な場所'}</p>
+          <p class="text-xs text-gray-400 mt-0.5">${time}</p>
+        </div>
+        <div>${badge}</div>
+      </div>`;
+  }).join('');
+}
+
+// ─── ステータス表示 ─────────────────────────────────
+function setStatus(msg, color) {
+  const el = document.getElementById('statusMsg');
+  const dotEl = document.getElementById('statusDot');
+  if (!el) return;
+  const colors = { green:'text-green-600', yellow:'text-yellow-500', red:'text-red-500', gray:'text-gray-400' };
+  const dots   = { green:'bg-green-500', yellow:'bg-yellow-400', red:'bg-red-400', gray:'bg-gray-300' };
+  el.className = 'text-sm font-medium ' + (colors[color]||colors.gray);
+  el.textContent = msg;
+  if (dotEl) dotEl.className = 'pulse w-2 h-2 rounded-full ' + (dots[color]||dots.gray);
+}
+
+// ─── 自動記録タイマー ──────────────────────────────
+let autoTimer = null, countdown = AUTO_INTERVAL_MIN * 60;
+
+function startAutoRecord() {
+  recordLocation(false);
+  autoTimer = setInterval(() => recordLocation(false), AUTO_INTERVAL_MIN * 60 * 1000);
+  // カウントダウン表示
+  setInterval(() => {
+    countdown--;
+    if (countdown <= 0) countdown = AUTO_INTERVAL_MIN * 60;
+    const min = Math.floor(countdown/60), sec = countdown % 60;
+    const el = document.getElementById('nextRecord');
+    if (el) el.textContent = `次の自動記録まで ${min}分${String(sec).padStart(2,'0')}秒`;
+  }, 1000);
+}
+
+// ─── 共有URL ───────────────────────────────────────
+function copyShareUrl() {
+  const url = location.origin + location.pathname + '?view=' + myUserId;
+  navigator.clipboard.writeText(url).then(() => {
+    const btn = document.getElementById('shareBtn');
+    const orig = btn.innerHTML;
+    btn.innerHTML = '✅ コピーしました';
+    btn.className = btn.className.replace('bg-indigo-500','bg-green-500');
+    setTimeout(() => { btn.innerHTML = orig; btn.className = btn.className.replace('bg-green-500','bg-indigo-500'); }, 2000);
+  }).catch(() => prompt('このURLをコピーしてください:', location.origin + location.pathname + '?view=' + myUserId));
+}
+
+// ─── タブ切り替え ──────────────────────────────────
+function switchTab(tab) {
+  ['tab-timeline','tab-map'].forEach(t => {
+    document.getElementById(t).className = t === tab
+      ? 'tab-active flex-1 text-center py-3 text-sm font-medium cursor-pointer'
+      : 'tab-inactive flex-1 text-center py-3 text-sm font-medium cursor-pointer';
+  });
+  document.getElementById('panel-timeline').style.display = tab === 'tab-timeline' ? 'block' : 'none';
+  document.getElementById('panel-map').style.display       = tab === 'tab-map'      ? 'block' : 'none';
+  if (tab === 'tab-map') { initMap(); updateMap(currentRecords()); }
+}
+
+function currentRecords() {
+  const rows = document.querySelectorAll('#recordList [data-idx]');
+  return []; // updateMapは既にloadRecords内で呼ばれているので不要
+}
+
+// ─── 起動 ─────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', async () => {
+  // Supabase接続テスト
+  const { error } = await db.from('locations').select('id').limit(1);
+  if (error) {
+    alert('Supabase接続エラー: ' + (error.message||error.code) + '\n\nSUPABASE_URL と SUPABASE_ANON_KEY を確認してください。');
+    return;
+  }
+
+  // 日付入力を今日に設定
+  const dateEl = document.getElementById('dateInput');
+  if (dateEl) dateEl.value = new Date().toLocaleDateString('sv');
+
+  if (isViewMode) {
+    // 閲覧モード
+    document.getElementById('viewModeBar').style.display = 'flex';
+    document.getElementById('recordActions').style.display = 'none';
+    document.getElementById('viewModeTitle').textContent = '📋 行動履歴を閲覧中';
+  } else {
+    // 記録モード
+    setStatus('起動中…', 'yellow');
+    startAutoRecord();
+    setStatus(`● 記録中（${AUTO_INTERVAL_MIN}分ごとに自動保存）`, 'green');
+  }
+
+  await loadRecords();
+});
+</script>
+
+<!-- ===== メイン UI ===== -->
+<div class="max-w-md mx-auto">
+
+  <!-- ヘッダー -->
+  <div class="bg-white border-b border-gray-100 px-4 py-4 sticky top-0 z-10 shadow-sm">
+    <div class="flex items-center justify-between">
+      <div>
+        <h1 class="text-lg font-bold text-gray-800">📍 いまどこ</h1>
+        <p id="viewModeTitle" class="text-xs text-gray-400 mt-0.5"></p>
+      </div>
+      <div id="recordActions">
+        <button onclick="copyShareUrl()" id="shareBtn"
+          class="bg-indigo-500 text-white text-xs font-medium px-3 py-2 rounded-lg">
+          🔗 共有
+        </button>
+      </div>
+    </div>
+
+    <!-- 閲覧モードバナー -->
+    <div id="viewModeBar" style="display:none"
+      class="mt-2 bg-indigo-50 text-indigo-600 text-xs rounded-lg px-3 py-2 flex items-center gap-2">
+      👀 <span>閲覧専用です（記録はできません）</span>
+    </div>
+  </div>
+
+  <!-- 記録ステータス（記録モードのみ） -->
+  <div id="recordActions" class="bg-white mx-4 mt-4 rounded-2xl border border-gray-100 shadow-sm p-4">
+    <div class="flex items-center gap-2 mb-3">
+      <span id="statusDot" class="pulse w-2 h-2 rounded-full bg-yellow-400"></span>
+      <span id="statusMsg" class="text-sm font-medium text-yellow-500">起動中…</span>
+    </div>
+    <p id="nextRecord" class="text-xs text-gray-400 mb-3"></p>
+    <button onclick="recordLocation(true)"
+      class="w-full bg-red-500 hover:bg-red-600 active:bg-red-700 text-white font-bold py-3 rounded-xl text-base transition-colors">
+      📌 今すぐ記録する
+    </button>
+  </div>
+
+  <!-- 日付選択 -->
+  <div class="px-4 mt-4">
+    <div class="bg-white rounded-xl border border-gray-100 shadow-sm px-4 py-3 flex items-center gap-3">
+      <span class="text-gray-400 text-sm">📅</span>
+      <input type="date" id="dateInput" onchange="loadRecords()"
+        class="flex-1 text-sm text-gray-700 bg-transparent outline-none" />
+      <span id="recordCount" class="text-xs text-gray-400 shrink-0">0件</span>
+    </div>
+  </div>
+
+  <!-- タブ -->
+  <div class="flex bg-white border-b border-gray-100 mx-4 mt-4 rounded-t-xl shadow-sm">
+    <div id="tab-timeline" class="tab-active flex-1 text-center py-3 text-sm font-medium cursor-pointer"
+      onclick="switchTab('tab-timeline')">タイムライン</div>
+    <div id="tab-map" class="tab-inactive flex-1 text-center py-3 text-sm font-medium cursor-pointer"
+      onclick="switchTab('tab-map')">地図</div>
+  </div>
+
+  <!-- タイムラインパネル -->
+  <div id="panel-timeline" class="bg-white mx-4 rounded-b-xl shadow-sm mb-8 overflow-hidden">
+    <div id="recordList" class="divide-y divide-gray-50">
+      <div class="text-center py-10 text-gray-400 text-sm">読み込み中…</div>
+    </div>
+  </div>
+
+  <!-- 地図パネル -->
+  <div id="panel-map" style="display:none" class="bg-white mx-4 rounded-b-xl shadow-sm mb-8 overflow-hidden">
+    <div id="map"></div>
+    <p class="text-xs text-gray-400 text-center py-2">
+      青マーカー: 自動記録 ／ 赤マーカー: 手動記録
+    </p>
+  </div>
+
+</div>
+</body>
+</html>
